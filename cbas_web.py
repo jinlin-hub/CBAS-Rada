@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import re
 import urllib.request
+import urllib.parse
 import json
 import ssl
 from datetime import datetime, timedelta
@@ -14,13 +15,13 @@ ssl_ctx.check_hostname = False
 ssl_ctx.verify_mode = ssl.CERT_NONE
 
 def get_stock_price_yahoo(stock_id):
-    """雅虎 API 直連 (內建 urllib)"""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    """雅虎 API 直連"""
+    headers = {'User-Agent': 'Mozilla/5.0'}
     for suffix in [".TW", ".TWO"]:
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?range=5d&interval=1d"
         try:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, context=ssl_ctx, timeout=5) as response:
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=8) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 result = data.get('chart', {}).get('result', [])
                 if result:
@@ -31,15 +32,15 @@ def get_stock_price_yahoo(stock_id):
     return 0
 
 def get_cbas_info(cb_code):
-    """從 thefew.tw 抓取 CBAS 權利金與轉換比例"""
+    """從 thefew.tw 抓取 CBAS 權利金"""
     url = f"https://thefew.tw/quote/{cb_code}"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     }
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, context=ssl_ctx, timeout=8) as response:
+        with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as response:
             html = response.read().decode('utf-8', errors='ignore')
             clean_text = re.sub(r'<[^>]+>', ' ', html)
             
@@ -48,56 +49,68 @@ def get_cbas_info(cb_code):
             
             ratio_match = re.search(r'轉換比例[\s\S]*?([\d\.]+)', clean_text)
             ratio = float(ratio_match.group(1)) if ratio_match else np.nan
-            
             return cbas_premium, ratio
     except Exception:
         return np.nan, np.nan
 
 # ==========================================
-# 🌐 Streamlit 網頁介面設計
+# 🌐 Streamlit 網頁介面與核心邏輯
 # ==========================================
 st.set_page_config(page_title="CBAS 智慧雷達", layout="wide", page_icon="🚀")
 
 st.title("🚀 CBAS 雙雲端可轉債異常量能雷達")
-st.markdown("點擊下方按鈕，系統將自動從 **公開資訊觀測站**、**櫃買中心** 與 **TheFew** 抓取最新數據進行運算。")
+st.markdown("點擊下方按鈕，系統將自動穿透防火牆，抓取最新量能與 CBAS 權利金。")
 
-# 啟動按鈕
 if st.button("⚡ 立即執行全自動掃描", type="primary"):
     
-    # 使用進度狀態框
     with st.status("系統運算中，請稍候...", expanded=True) as status:
         
+        # --- A. 取得轉換價格 (含代理穿透) ---
         st.write("🌐 正在獲取公開資訊觀測站「最新轉換價格表」...")
         conv_price_map = {}
         now = datetime.now()
-        last_month = now.replace(day=1) - timedelta(days=1)
-        last_last_month = last_month.replace(day=1) - timedelta(days=1)
-        months_to_try = [now.strftime('%Y%m'), last_month.strftime('%Y%m'), last_last_month.strftime('%Y%m')]
+        months_to_try = [now.strftime('%Y%m'), (now.replace(day=1) - timedelta(days=1)).strftime('%Y%m')]
         
         for yyyymm in months_to_try:
-            url = f"https://mopsov.twse.com.tw/nas/t120/CBTRN{yyyymm}.htm"
-            try:
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, context=ssl_ctx, timeout=5) as response:
-                    html_content = response.read().decode('big5', errors='ignore')
-                    rows = re.findall(r'<tr.*?>(.*?)</tr>', html_content, re.IGNORECASE | re.DOTALL)
-                    for row in rows:
-                        cols = re.findall(r'<td.*?>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
-                        if len(cols) >= 5:
-                            code_match = re.search(r'(\d{5,6})', cols[1])
-                            if not code_match: continue
-                            code = code_match.group(1)
-                            price_text = re.sub(r'<.*?>', '', cols[4]).replace(',', '').strip()
-                            try:
-                                if float(price_text) > 0: conv_price_map[code] = float(price_text)
-                            except: continue
+            base_url = f"https://mopsov.twse.com.tw/nas/t120/CBTRN{yyyymm}.htm"
+            # 🛡️ 雙軌制：先試直接連線，若被擋則啟用代理繞道
+            urls_to_try = [
+                base_url,
+                f"https://api.allorigins.win/raw?url={urllib.parse.quote(base_url)}"
+            ]
+            
+            for url in urls_to_try:
+                try:
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0'})
+                    with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as response:
+                        raw = response.read()
+                        try:
+                            html_content = raw.decode('big5')
+                        except:
+                            html_content = raw.decode('utf-8', errors='ignore')
+                            
+                        rows = re.findall(r'<tr.*?>(.*?)</tr>', html_content, re.IGNORECASE | re.DOTALL)
+                        for row in rows:
+                            cols = re.findall(r'<td.*?>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
+                            if len(cols) >= 5:
+                                code_match = re.search(r'(\d{5,6})', cols[1])
+                                if not code_match: continue
+                                code = code_match.group(1)
+                                price_text = re.sub(r'<.*?>', '', cols[4]).replace(',', '').strip()
+                                try:
+                                    if float(price_text) > 0: conv_price_map[code] = float(price_text)
+                                except: continue
+                except: continue
                 if conv_price_map: break
-            except: continue
+            if conv_price_map: 
+                st.write(f"✅ 成功載入 {len(conv_price_map)} 檔轉換價格")
+                break
 
         if not conv_price_map:
-            status.update(label="❌ 無法取得轉換價格", state="error")
+            status.update(label="❌ 無法取得轉換價格 (防火牆阻擋)", state="error")
             st.stop()
 
+        # --- B. 下載櫃買中心行情 (含代理穿透) ---
         st.write("🌐 正在下載近一個月行情資料 (計算量能)...")
         all_dfs = []
         valid_days = 0
@@ -111,37 +124,46 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
             yyyy = target_date.strftime('%Y')
             yyyymm = target_date.strftime('%Y%m')
             yyyymmdd = target_date.strftime('%Y%m%d')
-            csv_url = f"https://www.tpex.org.tw/storage/bond_zone/tradeinfo/cb/{yyyy}/{yyyymm}/RSta0113.{yyyymmdd}-C.csv"
+            csv_base = f"https://www.tpex.org.tw/storage/bond_zone/tradeinfo/cb/{yyyy}/{yyyymm}/RSta0113.{yyyymmdd}-C.csv"
             
-            try:
-                req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, context=ssl_ctx, timeout=5) as response:
-                    content = response.read().decode('cp950', errors='ignore')
-                    lines = content.splitlines()
-                    date_match = re.search(r'日期:(\d+)年(\d+)月(\d+)日', "".join(lines[:10]))
-                    date_str = f"{int(date_match.group(1))+1911}-{date_match.group(2).zfill(2)}-{date_match.group(3).zfill(2)}" if date_match else "Unknown"
-                    
-                    rows = []
-                    for line in lines:
-                        if line.startswith('BODY'):
-                            cols = [c.strip().strip('"') for c in line.replace('\t', ',').split(',')]
-                            if '等價' in cols:
-                                idx = cols.index('等價')
-                                try:
-                                    name = cols[idx - 1]
-                                    code_match = re.search(r'\d{5,6}', cols[0])
-                                    code = code_match.group(0) if code_match else cols[idx - 2]
-                                    rows.append([code, name, cols[idx + 1], cols[idx + 7], date_str])
-                                except: continue
-                    if rows:
-                        all_dfs.append(pd.DataFrame(rows, columns=['代號', '名稱', '收市', '單位', 'Date']))
-                        valid_days += 1
-            except: pass
+            csv_urls = [csv_base, f"https://api.allorigins.win/raw?url={urllib.parse.quote(csv_base)}"]
+            
+            success = False
+            for csv_url in csv_urls:
+                try:
+                    req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as response:
+                        content = response.read().decode('cp950', errors='ignore')
+                        lines = content.splitlines()
+                        date_match = re.search(r'日期:(\d+)年(\d+)月(\d+)日', "".join(lines[:10]))
+                        date_str = f"{int(date_match.group(1))+1911}-{date_match.group(2).zfill(2)}-{date_match.group(3).zfill(2)}" if date_match else "Unknown"
+                        
+                        rows = []
+                        for line in lines:
+                            if line.startswith('BODY'):
+                                cols = [c.strip().strip('"') for c in line.replace('\t', ',').split(',')]
+                                if '等價' in cols:
+                                    idx = cols.index('等價')
+                                    try:
+                                        name = cols[idx - 1]
+                                        code_match = re.search(r'\d{5,6}', cols[0])
+                                        code = code_match.group(0) if code_match else cols[idx - 2]
+                                        rows.append([code, name, cols[idx + 1], cols[idx + 7], date_str])
+                                    except: continue
+                        if rows:
+                            all_dfs.append(pd.DataFrame(rows, columns=['代號', '名稱', '收市', '單位', 'Date']))
+                            valid_days += 1
+                            st.write(f"📥 成功下載 {yyyymmdd}")
+                            success = True
+                            break
+                except: pass
+            if success: continue
 
         if len(all_dfs) < 20:
             status.update(label="❌ 有效天數不足，請稍後再試", state="error")
             st.stop()
 
+        # --- C. 運算 Z-Score 與精算溢價率 ---
         st.write("📈 正在執行量能 Z-Score 與 CBAS 進階數據精算...")
         full_df = pd.concat(all_dfs, ignore_index=True)
         full_df['成交張數'] = pd.to_numeric(full_df['單位'].str.replace(',', ''), errors='coerce').fillna(0)
@@ -180,11 +202,9 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
 
             status.update(label="🎉 掃描完成！", state="complete")
             
-            # 1. 在網頁上直接顯示表格
             st.subheader("📊 掃描結果預覽")
             st.dataframe(final_df, use_container_width=True)
 
-            # 2. 將 Excel 寫入記憶體並提供下載按鈕
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 final_df.to_excel(writer, index=False, sheet_name='異常爆量掃描')
