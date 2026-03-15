@@ -32,7 +32,7 @@ def get_stock_price_yahoo(stock_id):
     return 0
 
 def get_cbas_info(cb_code):
-    """從 thefew.tw 抓取 CBAS 權利金、轉換比例與未平倉量"""
+    """從 thefew.tw 抓取 CBAS 權利金、轉換比例與未平倉量 (V59 終極精準版)"""
     url = f"https://thefew.tw/quote/{cb_code}"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0',
@@ -44,15 +44,20 @@ def get_cbas_info(cb_code):
             html = response.read().decode('utf-8', errors='ignore')
             clean_text = re.sub(r'<[^>]+>', ' ', html)
             
-            cbas_match = re.search(r'CBAS\s*權利金[\s\S]*?([\d\.]+)', clean_text)
+            # 🎯 [^\d]* 代表「跳過所有不是數字的字元」，直到撞見第一個數字為止
+            cbas_match = re.search(r'CBAS\s*權利金[^\d]*([\d\.]+)', clean_text)
             cbas_premium = float(cbas_match.group(1)) if cbas_match else np.nan
             
-            ratio_match = re.search(r'轉換比例[\s\S]*?([\d\.]+)', clean_text)
+            ratio_match = re.search(r'轉換比例[^\d]*([\d\.]+)', clean_text)
             ratio = float(ratio_match.group(1)) if ratio_match else np.nan
             
-            # 🎯 新增：抓取「未平倉」數據 (自動過濾千分位逗號)
-            oi_match = re.search(r'未平倉[\s\S]*?([\d\,]+)', clean_text)
-            open_interest = int(oi_match.group(1).replace(',', '')) if oi_match else np.nan
+            # 🎯 終極鎖定：找到「未平倉」，跳過中間所有文字符號，直接抓取第一組數字
+            oi_match = re.search(r'未平倉[^\d]*([\d\,]+)', clean_text)
+            if oi_match:
+                # 把千分位逗號取代成空白，並安全轉型為數字
+                open_interest = float(oi_match.group(1).replace(',', ''))
+            else:
+                open_interest = np.nan
             
             return cbas_premium, ratio, open_interest
     except Exception:
