@@ -32,7 +32,7 @@ def get_stock_price_yahoo(stock_id):
     return 0
 
 def get_cbas_info(cb_code):
-    """從 thefew.tw 抓取 CBAS 權利金"""
+    """從 thefew.tw 抓取 CBAS 權利金、轉換比例與未平倉量"""
     url = f"https://thefew.tw/quote/{cb_code}"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0',
@@ -49,9 +49,14 @@ def get_cbas_info(cb_code):
             
             ratio_match = re.search(r'轉換比例[\s\S]*?([\d\.]+)', clean_text)
             ratio = float(ratio_match.group(1)) if ratio_match else np.nan
-            return cbas_premium, ratio
+            
+            # 🎯 新增：抓取「未平倉」數據 (自動過濾千分位逗號)
+            oi_match = re.search(r'未平倉[\s\S]*?([\d\,]+)', clean_text)
+            open_interest = int(oi_match.group(1).replace(',', '')) if oi_match else np.nan
+            
+            return cbas_premium, ratio, open_interest
     except Exception:
-        return np.nan, np.nan
+        return np.nan, np.nan, np.nan
 
 # ==========================================
 # 🌐 Streamlit 網頁介面與核心邏輯
@@ -59,13 +64,12 @@ def get_cbas_info(cb_code):
 st.set_page_config(page_title="CBAS 智慧雷達", layout="wide", page_icon="🚀")
 
 st.title("🚀 CBAS 雙雲端可轉債異常量能雷達")
-st.markdown("點擊下方按鈕，系統將自動穿透防火牆，抓取最新量能與 CBAS 權利金。")
+st.markdown("點擊下方按鈕，系統將自動穿透防火牆，抓取最新量能、權利金與大戶未平倉籌碼。")
 
 if st.button("⚡ 立即執行全自動掃描", type="primary"):
     
     with st.status("系統運算中，請稍候...", expanded=True) as status:
         
-        # --- A. 取得轉換價格 (含代理穿透) ---
         st.write("🌐 正在獲取公開資訊觀測站「最新轉換價格表」...")
         conv_price_map = {}
         now = datetime.now()
@@ -73,7 +77,6 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
         
         for yyyymm in months_to_try:
             base_url = f"https://mopsov.twse.com.tw/nas/t120/CBTRN{yyyymm}.htm"
-            # 🛡️ 雙軌制：先試直接連線，若被擋則啟用代理繞道
             urls_to_try = [
                 base_url,
                 f"https://api.allorigins.win/raw?url={urllib.parse.quote(base_url)}"
@@ -110,7 +113,6 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
             status.update(label="❌ 無法取得轉換價格 (防火牆阻擋)", state="error")
             st.stop()
 
-        # --- B. 下載櫃買中心行情 (含代理穿透) ---
         st.write("🌐 正在下載近一個月行情資料 (計算量能)...")
         all_dfs = []
         valid_days = 0
@@ -163,7 +165,6 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
             status.update(label="❌ 有效天數不足，請稍後再試", state="error")
             st.stop()
 
-        # --- C. 運算 Z-Score 與精算溢價率 ---
         st.write("📈 正在執行量能 Z-Score 與 CBAS 進階數據精算...")
         full_df = pd.concat(all_dfs, ignore_index=True)
         full_df['成交張數'] = pd.to_numeric(full_df['單位'].str.replace(',', ''), errors='coerce').fillna(0)
@@ -185,9 +186,11 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
         if not results.empty:
             results['現股收盤價'] = results['現股代號'].apply(get_stock_price_yahoo)
             
+            # 🎯 拆解 TheFew 傳回的 3 個籌碼數據
             results['cbas_info'] = results['代號'].apply(get_cbas_info)
             results['CBAS權利金'] = results['cbas_info'].apply(lambda x: x[0])
             results['轉換比例'] = results['cbas_info'].apply(lambda x: x[1])
+            results['未平倉量(張)'] = results['cbas_info'].apply(lambda x: x[2])
             
             def calc_premium(row):
                 if row['轉換價格'] > 0 and row['現股收盤價'] > 0:
@@ -197,7 +200,8 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
 
             results['實際溢價率%'] = results.apply(calc_premium, axis=1)
 
-            out_cols = ['Date', '代號', '名稱', '現股代號', '等級', '成交張數', 'z_score', 'CB收盤價', '轉換價格', '現股收盤價', '實際溢價率%', 'CBAS權利金', '轉換比例']
+            # 🎯 報表欄位新增「未平倉量(張)」
+            out_cols = ['Date', '代號', '名稱', '現股代號', '等級', '成交張數', 'z_score', 'CB收盤價', '轉換價格', '現股收盤價', '實際溢價率%', 'CBAS權利金', '轉換比例', '未平倉量(張)']
             final_df = results[out_cols]
 
             status.update(label="🎉 掃描完成！", state="complete")
