@@ -32,7 +32,7 @@ def get_stock_price_yahoo(stock_id):
     return 0
 
 def get_cbas_info(cb_code):
-    """從 thefew.tw 抓取 CBAS 權利金、轉換比例與未平倉量 (V59 終極精準版)"""
+    """從 thefew.tw 抓取 CBAS 權利金與轉換比例"""
     url = f"https://thefew.tw/quote/{cb_code}"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0',
@@ -44,69 +44,52 @@ def get_cbas_info(cb_code):
             html = response.read().decode('utf-8', errors='ignore')
             clean_text = re.sub(r'<[^>]+>', ' ', html)
             
-            # 🎯 [^\d]* 代表「跳過所有不是數字的字元」，直到撞見第一個數字為止
             cbas_match = re.search(r'CBAS\s*權利金[^\d]*([\d\.]+)', clean_text)
             cbas_premium = float(cbas_match.group(1)) if cbas_match else np.nan
             
             ratio_match = re.search(r'轉換比例[^\d]*([\d\.]+)', clean_text)
             ratio = float(ratio_match.group(1)) if ratio_match else np.nan
             
-            # 🎯 終極鎖定：找到「未平倉」，跳過中間所有文字符號，直接抓取第一組數字
-            oi_match = re.search(r'未平倉[^\d]*([\d\,]+)', clean_text)
-            if oi_match:
-                # 把千分位逗號取代成空白，並安全轉型為數字
-                open_interest = float(oi_match.group(1).replace(',', ''))
-            else:
-                open_interest = np.nan
-            
-            return cbas_premium, ratio, open_interest
+            return cbas_premium, ratio
     except Exception:
-        return np.nan, np.nan, np.nan
+        return np.nan, np.nan
 
 # ==========================================
 # 🌐 Streamlit 網頁介面與核心邏輯
 # ==========================================
 st.set_page_config(page_title="CBAS 智慧雷達", layout="wide", page_icon="🚀")
 
-st.title("🚀 CBAS 雙雲端可轉債異常量能雷達")
-st.markdown("點擊下方按鈕，系統將自動穿透防火牆，抓取最新量能、權利金與大戶未平倉籌碼。")
+st.title("🚀 CBAS 四雲端可轉債異常量能雷達")
+st.markdown("點擊下方按鈕，系統將自動穿透防火牆，抓取最新量能、權利金與 **官方未平倉籌碼**。")
 
 if st.button("⚡ 立即執行全自動掃描", type="primary"):
     
     with st.status("系統運算中，請稍候...", expanded=True) as status:
         
-        st.write("🌐 正在獲取公開資訊觀測站「最新轉換價格表」...")
+        # --- 引擎 A：轉換價格 ---
+        st.write("🌐 (1/4) 正在獲取公開資訊觀測站「最新轉換價格表」...")
         conv_price_map = {}
         now = datetime.now()
         months_to_try = [now.strftime('%Y%m'), (now.replace(day=1) - timedelta(days=1)).strftime('%Y%m')]
         
         for yyyymm in months_to_try:
             base_url = f"https://mopsov.twse.com.tw/nas/t120/CBTRN{yyyymm}.htm"
-            urls_to_try = [
-                base_url,
-                f"https://api.allorigins.win/raw?url={urllib.parse.quote(base_url)}"
-            ]
+            urls_to_try = [base_url, f"https://api.allorigins.win/raw?url={urllib.parse.quote(base_url)}"]
             
             for url in urls_to_try:
                 try:
-                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0'})
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                     with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as response:
-                        raw = response.read()
-                        try:
-                            html_content = raw.decode('big5')
-                        except:
-                            html_content = raw.decode('utf-8', errors='ignore')
-                            
+                        html_content = response.read().decode('big5', errors='ignore')
                         rows = re.findall(r'<tr.*?>(.*?)</tr>', html_content, re.IGNORECASE | re.DOTALL)
                         for row in rows:
                             cols = re.findall(r'<td.*?>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
                             if len(cols) >= 5:
                                 code_match = re.search(r'(\d{5,6})', cols[1])
                                 if not code_match: continue
-                                code = code_match.group(1)
                                 price_text = re.sub(r'<.*?>', '', cols[4]).replace(',', '').strip()
                                 try:
-                                    if float(price_text) > 0: conv_price_map[code] = float(price_text)
+                                    if float(price_text) > 0: conv_price_map[code_match.group(1)] = float(price_text)
                                 except: continue
                 except: continue
                 if conv_price_map: break
@@ -115,10 +98,51 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
                 break
 
         if not conv_price_map:
-            status.update(label="❌ 無法取得轉換價格 (防火牆阻擋)", state="error")
+            status.update(label="❌ 無法取得轉換價格", state="error")
             st.stop()
 
-        st.write("🌐 正在下載近一個月行情資料 (計算量能)...")
+        # --- 引擎 D：櫃買中心 CBAS 未平倉量 (全新加入！) ---
+        st.write("🌐 (2/4) 正在抓取櫃買中心「官方大戶未平倉籌碼」...")
+        cbas_oi_map = {}
+        # 往前推 7 天，找尋最新的一份未平倉報告
+        for days_back in range(7):
+            target_date = datetime.now() - timedelta(days=days_back)
+            if target_date.weekday() >= 5: continue
+            yyyy = target_date.strftime('%Y')
+            yyyymm = target_date.strftime('%Y%m')
+            yyyymmdd = target_date.strftime('%Y%m%d')
+            
+            oi_csv_base = f"https://www.tpex.org.tw/storage/bond_zone/tradeinfo/cbas/{yyyy}/{yyyymm}/RStc0111.{yyyymmdd}-C.csv"
+            oi_urls = [oi_csv_base, f"https://api.allorigins.win/raw?url={urllib.parse.quote(oi_csv_base)}"]
+            
+            success = False
+            for oi_url in oi_urls:
+                try:
+                    req = urllib.request.Request(oi_url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req, context=ssl_ctx, timeout=8) as response:
+                        content = response.read().decode('cp950', errors='ignore')
+                        for line in content.splitlines():
+                            if line.startswith('BODY'):
+                                # 清洗 CSV 欄位，過濾空白
+                                cols = [c.strip().strip('"') for c in line.replace('\t', ',').split(',')]
+                                cols = [c for c in cols if c]
+                                if len(cols) >= 3:
+                                    code_match = re.search(r'\d{5,6}', cols[0])
+                                    if code_match:
+                                        try:
+                                            # 最後一個欄位即為未平倉餘額
+                                            oi_val = float(cols[-1].replace(',', ''))
+                                            cbas_oi_map[code_match.group(0)] = int(oi_val)
+                                        except: pass
+                        if cbas_oi_map:
+                            st.write(f"✅ 成功載入 {len(cbas_oi_map)} 檔未平倉籌碼 ({yyyymmdd})")
+                            success = True
+                            break
+                except: pass
+            if success: break
+
+        # --- 引擎 B：近期行情 ---
+        st.write("🌐 (3/4) 正在下載近一個月行情資料 (計算量能)...")
         all_dfs = []
         valid_days = 0
         days_offset = 0
@@ -132,7 +156,6 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
             yyyymm = target_date.strftime('%Y%m')
             yyyymmdd = target_date.strftime('%Y%m%d')
             csv_base = f"https://www.tpex.org.tw/storage/bond_zone/tradeinfo/cb/{yyyy}/{yyyymm}/RSta0113.{yyyymmdd}-C.csv"
-            
             csv_urls = [csv_base, f"https://api.allorigins.win/raw?url={urllib.parse.quote(csv_base)}"]
             
             success = False
@@ -152,15 +175,14 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
                                 if '等價' in cols:
                                     idx = cols.index('等價')
                                     try:
-                                        name = cols[idx - 1]
                                         code_match = re.search(r'\d{5,6}', cols[0])
                                         code = code_match.group(0) if code_match else cols[idx - 2]
-                                        rows.append([code, name, cols[idx + 1], cols[idx + 7], date_str])
+                                        rows.append([code, cols[idx - 1], cols[idx + 1], cols[idx + 7], date_str])
                                     except: continue
                         if rows:
                             all_dfs.append(pd.DataFrame(rows, columns=['代號', '名稱', '收市', '單位', 'Date']))
                             valid_days += 1
-                            st.write(f"📥 成功下載 {yyyymmdd}")
+                            st.write(f"📥 成功下載 {yyyymmdd} 行情")
                             success = True
                             break
                 except: pass
@@ -170,7 +192,8 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
             status.update(label="❌ 有效天數不足，請稍後再試", state="error")
             st.stop()
 
-        st.write("📈 正在執行量能 Z-Score 與 CBAS 進階數據精算...")
+        # --- 運算與整合 ---
+        st.write("📈 (4/4) 正在執行 Z-Score 與全籌碼數據精算...")
         full_df = pd.concat(all_dfs, ignore_index=True)
         full_df['成交張數'] = pd.to_numeric(full_df['單位'].str.replace(',', ''), errors='coerce').fillna(0)
         full_df['CB收盤價'] = pd.to_numeric(full_df['收市'].str.replace(',', ''), errors='coerce').fillna(0)
@@ -191,11 +214,13 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
         if not results.empty:
             results['現股收盤價'] = results['現股代號'].apply(get_stock_price_yahoo)
             
-            # 🎯 拆解 TheFew 傳回的 3 個籌碼數據
+            # 從 TheFew 抓權利金與比例
             results['cbas_info'] = results['代號'].apply(get_cbas_info)
             results['CBAS權利金'] = results['cbas_info'].apply(lambda x: x[0])
             results['轉換比例'] = results['cbas_info'].apply(lambda x: x[1])
-            results['未平倉量(張)'] = results['cbas_info'].apply(lambda x: x[2])
+            
+            # 從第 4 顆引擎 (官方籌碼) 對應未平倉量
+            results['未平倉量(張)'] = results['代號'].map(cbas_oi_map).fillna(0)
             
             def calc_premium(row):
                 if row['轉換價格'] > 0 and row['現股收盤價'] > 0:
@@ -205,11 +230,10 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
 
             results['實際溢價率%'] = results.apply(calc_premium, axis=1)
 
-            # 🎯 報表欄位新增「未平倉量(張)」
             out_cols = ['Date', '代號', '名稱', '現股代號', '等級', '成交張數', 'z_score', 'CB收盤價', '轉換價格', '現股收盤價', '實際溢價率%', 'CBAS權利金', '轉換比例', '未平倉量(張)']
             final_df = results[out_cols]
 
-            status.update(label="🎉 掃描完成！", state="complete")
+            status.update(label="🎉 掃描完成！四引擎資料已整合", state="complete")
             
             st.subheader("📊 掃描結果預覽")
             st.dataframe(final_df, use_container_width=True)
