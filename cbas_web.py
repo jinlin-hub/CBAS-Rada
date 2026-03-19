@@ -101,10 +101,9 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
             status.update(label="❌ 無法取得轉換價格", state="error")
             st.stop()
 
-        # --- 引擎 D：櫃買中心 CBAS 未平倉量 (全新加入！) ---
+        # --- 引擎 D：櫃買中心 CBAS 未平倉量 ---
         st.write("🌐 (2/4) 正在抓取櫃買中心「官方大戶未平倉籌碼」...")
         cbas_oi_map = {}
-        # 往前推 7 天，找尋最新的一份未平倉報告
         for days_back in range(7):
             target_date = datetime.now() - timedelta(days=days_back)
             if target_date.weekday() >= 5: continue
@@ -123,14 +122,12 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
                         content = response.read().decode('cp950', errors='ignore')
                         for line in content.splitlines():
                             if line.startswith('BODY'):
-                                # 清洗 CSV 欄位，過濾空白
                                 cols = [c.strip().strip('"') for c in line.replace('\t', ',').split(',')]
                                 cols = [c for c in cols if c]
                                 if len(cols) >= 3:
                                     code_match = re.search(r'\d{5,6}', cols[0])
                                     if code_match:
                                         try:
-                                            # 最後一個欄位即為未平倉餘額
                                             oi_val = float(cols[-1].replace(',', ''))
                                             cbas_oi_map[code_match.group(0)] = int(oi_val)
                                         except: pass
@@ -141,13 +138,14 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
                 except: pass
             if success: break
 
-        # --- 引擎 B：近期行情 ---
-        st.write("🌐 (3/4) 正在下載近一個月行情資料 (計算量能)...")
+        # --- 引擎 B：近期行情 (已修正為最多擷取 20 天) ---
+        st.write("🌐 (3/4) 正在下載近 20 日行情資料 (計算量能)...")
         all_dfs = []
         valid_days = 0
         days_offset = 0
 
-        while valid_days < 25 and days_offset < 60:
+        # 🎯 條件改為 valid_days < 20，精準抓取 20 天資料即停止
+        while valid_days < 20 and days_offset < 60:
             target_date = datetime.now() - timedelta(days=days_offset)
             days_offset += 1
             if target_date.weekday() >= 5: continue
@@ -188,7 +186,7 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
                 except: pass
             if success: continue
 
-        if len(all_dfs) < 20:
+        if len(all_dfs) < 15:
             status.update(label="❌ 有效天數不足，請稍後再試", state="error")
             st.stop()
 
@@ -200,8 +198,9 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
         full_df = full_df.sort_values(['代號', 'Date'])
 
         grouped = full_df.groupby('代號')['成交張數']
-        full_df['ma20'] = grouped.transform(lambda x: x.rolling(20).mean())
-        full_df['std20'] = grouped.transform(lambda x: x.rolling(20).std())
+        # 🎯 加上 min_periods=15，避免不到 20 天的冷門標的算不出均線
+        full_df['ma20'] = grouped.transform(lambda x: x.rolling(20, min_periods=15).mean())
+        full_df['std20'] = grouped.transform(lambda x: x.rolling(20, min_periods=15).std())
         full_df['z_score'] = (full_df['成交張數'] - full_df['ma20']) / (full_df['std20'] + 0.1)
 
         latest = full_df.groupby('代號').tail(1).copy()
@@ -209,17 +208,16 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
         latest['現股代號'] = latest['代號'].str[:4]
         
         latest['等級'] = latest.apply(lambda r: '🔥 S級' if r['z_score'] > 2.33 and r['成交張數'] > 100 else ('⚠️ A級' if r['z_score'] > 1.645 and r['成交張數'] > 50 else 'Normal'), axis=1)
-        results = latest[latest['等級'] != 'Normal'].copy()
+        
+        # 篩選異常爆量名單
+        results = latest[(latest['等級'] != 'Normal') & (~latest['名稱'].str.contains('宜錦', na=False))].copy()
 
         if not results.empty:
             results['現股收盤價'] = results['現股代號'].apply(get_stock_price_yahoo)
             
-            # 從 TheFew 抓權利金與比例
             results['cbas_info'] = results['代號'].apply(get_cbas_info)
             results['CBAS權利金'] = results['cbas_info'].apply(lambda x: x[0])
             results['轉換比例'] = results['cbas_info'].apply(lambda x: x[1])
-            
-            # 從第 4 顆引擎 (官方籌碼) 對應未平倉量
             results['未平倉量(張)'] = results['代號'].map(cbas_oi_map).fillna(0)
             
             def calc_premium(row):
@@ -233,7 +231,7 @@ if st.button("⚡ 立即執行全自動掃描", type="primary"):
             out_cols = ['Date', '代號', '名稱', '現股代號', '等級', '成交張數', 'z_score', 'CB收盤價', '轉換價格', '現股收盤價', '實際溢價率%', 'CBAS權利金', '轉換比例', '未平倉量(張)']
             final_df = results[out_cols]
 
-            status.update(label="🎉 掃描完成！四引擎資料已整合", state="complete")
+            status.update(label="🎉 掃描完成！資料已整合", state="complete")
             
             st.subheader("📊 掃描結果預覽")
             st.dataframe(final_df, use_container_width=True)
